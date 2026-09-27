@@ -20,6 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Профиль проверки. В эталоне документы содержат заготовки {{ ... }}, и
+    # профиль template требует их наличия, а профиль team требует заполнения.
+    # Один и тот же файл лежит и в эталоне, и в репозиториях команд, поэтому
+    # профиль задаётся переменной репозитория: в эталоне VALIDATION_PROFILE=template,
+    # в репозиториях команд переменной нет и остаётся team.
+    env:
+      PROFILE: ${{ vars.VALIDATION_PROFILE || 'team' }}
+
     steps:
       - name: Получить код
         uses: actions/checkout@v7
@@ -35,17 +43,18 @@ jobs:
         run: python -m pip install --disable-pip-version-check "pyyaml==6.0.3" "jsonschema==4.26.0"
 
       - name: Проверить обязательные файлы, секции и заготовки
-        run: python scripts/validate_docs.py --root . --profile team --ci
+        run: python scripts/validate_docs.py --root . --profile "$PROFILE" --ci
 
       - name: Проверить метаданные команды
         run: |
           python - <<'PY'
+          import os
           import sys
           from pathlib import Path
           sys.path.insert(0, "scripts")
           from validate_docs import validate
 
-          report = validate(Path(".").resolve(), "team")
+          report = validate(Path(".").resolve(), os.environ.get("PROFILE", "team"))
           meta_findings = [f for f in report.findings if f.path == "data/meta.yml"]
           if not meta_findings:
               print("метаданные команды корректны")
@@ -76,4 +85,4 @@ jobs:
       - name: Сводка в Summary
         if: always()
         run: |
-          python scripts/validate_docs.py --root . --profile team >> "$GITHUB_STEP_SUMMARY" || true
+          python scripts/validate_docs.py --root . --profile "$PROFILE" >> "$GITHUB_STEP_SUMMARY" || true
