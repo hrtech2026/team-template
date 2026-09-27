@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Репозиторий практики
+    url: https://github.com/YOUR_STUDENT_ORG/hrtech-practice
+    about: Регламент, расписание, ответы на частые вопросы
+  - name: Вопрос по практике
+    url: https://github.com/YOUR_STUDENT_ORG/hrtech-practice/issues/new/choose
+    about: Задать вопрос преподавателю, если он не разрешается в Issue этого репозитория
