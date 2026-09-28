@@ -134,6 +134,7 @@ NAME_MIN_LENGTH = 3
 NAME_MAX_LENGTH = 60
 ID_MAX_LENGTH = 64
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+REMOTE_URL_RE = re.compile(r"url\s*=\s*(?P<url>\S+)")
 
 
 @dataclass(frozen=True)
@@ -425,6 +426,37 @@ def check_document(root: Path, report: Report, relative: str, profile: Profile) 
         check_placeholders(root, report, relative)
 
 
+def repository_name(root: Path) -> str | None:
+    """Read the repository name from the `origin` remote, if there is one.
+
+    Only used by the `team` profile, and only to cross-check `data/meta.yml`
+    against the directory the team actually works in. Returns `None` when the
+    tree is not a git checkout — a scaffolded copy on a laptop, for instance —
+    because a check that cannot run must not be reported as a failure.
+    """
+    config = root / ".git" / "config"
+    if not config.is_file():
+        return None
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    in_origin = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_origin = stripped in {'[remote "origin"]'}
+            continue
+        if not in_origin:
+            continue
+        match = REMOTE_URL_RE.match(stripped)
+        if match is None:
+            continue
+        url = match.group("url").removesuffix(".git").rstrip("/")
+        return url.rsplit("/", 1)[-1] or None
+    return None
+
+
 def check_meta(root: Path, report: Report) -> None:
     target = root / "data/meta.yml"
     if not target.is_file():
@@ -448,10 +480,25 @@ def check_meta(root: Path, report: Report) -> None:
                 "error",
                 "meta.id_format",
                 "data/meta.yml",
-                f"`id` должен быть вида team-<track>-<NN>, получено `{team_id}`",
+                f"`id` должен иметь вид team-<трек>-<NN>, получено `{team_id}`",
             )
         if len(team_id) > ID_MAX_LENGTH:
             report.add("error", "meta.id_length", "data/meta.yml", f"`id` длиннее {ID_MAX_LENGTH}")
+        # The repository is created as team-<track>-<NN> and cannot be renamed,
+        # so an `id` that disagrees with the directory name means the file
+        # still describes somebody else's team. Catching it here fails the
+        # team's own pull request instead of publishing the mismatch to the
+        # showcase. The template profile is exempt on purpose: the reference
+        # repository is called `team-template` and its `id` is a placeholder.
+        current = repository_name(root)
+        if current and team_id != current:
+            report.add(
+                "error",
+                "meta.id_mismatch",
+                "data/meta.yml",
+                f"`id` ({team_id}) не совпадает с именем репозитория ({current}). "
+                "Значение проставляется воркфлоу provision-team.yml по заявке команды.",
+            )
 
     name = data.get("name")
     if isinstance(name, str) and name and not NAME_MIN_LENGTH <= len(name) <= NAME_MAX_LENGTH:
