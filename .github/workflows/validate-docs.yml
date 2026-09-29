@@ -44,31 +44,42 @@ jobs:
       # в main.
       - name: Определить круг проверки
         id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "value=full" >> "$GITHUB_OUTPUT"
-            echo "ветка обновлена напрямую, проверяем всё" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          changed=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed="$(git diff --name-only "origin/main...HEAD" || true)"
+          else
+            # Пуш в main — это результат слитого запроса, и состав изменений
+            # виден между прежней головой ветки и новой. Проверять документы
+            # полностью после слияния, где их не трогали, значило бы оставить
+            # на main красную галочку у команды, чьи документы ещё пусты.
+            if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+              changed="$(git diff --name-only "${BEFORE}" HEAD 2>/dev/null || true)"
+            fi
+            if [ -z "${changed}" ]; then
+              changed="$(git diff --name-only HEAD^ HEAD 2>/dev/null || true)"
+            fi
           fi
-          changed="$(git diff --name-only "origin/main...HEAD" || true)"
-          if [ -z "$changed" ]; then
+          if [ -z "${changed}" ]; then
             echo "value=full" >> "$GITHUB_OUTPUT"
             echo "не удалось определить состав изменений, проверяем всё" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if printf '%s\n' "$changed" | grep -qv '^data/'; then
+          if printf '%s\n' "${changed}" | grep -qv '^data/'; then
             echo "value=full" >> "$GITHUB_OUTPUT"
             {
               echo "изменены файлы за пределами data/:"
-              printf '%s\n' "$changed"
+              printf '%s\n' "${changed}"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "value=meta" >> "$GITHUB_OUTPUT"
           {
             echo "изменён только data/, проверяем метаданные:"
-            printf '%s\n' "$changed"
+            printf '%s\n' "${changed}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Установить Python
