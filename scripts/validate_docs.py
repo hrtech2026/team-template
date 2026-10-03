@@ -20,6 +20,7 @@ from typing import Any, Literal
 import yaml
 
 Profile = Literal["team", "template", "coordination"]
+Scope = Literal["full", "meta", "none"]
 
 FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -96,6 +97,19 @@ DOCUMENT_SPECS: dict[str, dict[str, Any]] = {
 OPTIONAL_TEAM_FILES = ("docs/05_glossary.md",)
 REQUIRED_TEAM_FILES = tuple(path for path in DOCUMENT_SPECS if path not in OPTIONAL_TEAM_FILES)
 REQUIRED_TEAM_PATHS = (*REQUIRED_TEAM_FILES, "data/meta.yml", "README.md")
+
+# What the `team` profile reads, and therefore what a commit has to touch to be
+# able to fail it. A change outside these paths cannot turn a full validation
+# red, so running one on it only repeats an old verdict about documents nobody
+# touched — right after provisioning that is the whole difference between a
+# green check and an error about `{{ ... }}` that the team never left.
+FULL_SCOPE_PREFIXES = ("docs/",)
+# `data/meta.yml` is deliberately absent: it is metadata, and a change to it is
+# what the `meta` scope exists for. Listing it here would send every roster
+# change through the full validation and freeze a fresh team on its own
+# scaffolding all over again.
+FULL_SCOPE_FILES = frozenset({*REQUIRED_TEAM_FILES, "README.md", "scripts/validate_docs.py"})
+META_SCOPE_PREFIXES = ("data/",)
 
 REQUIRED_COORDINATION_FILES = (
     "README.md",
@@ -687,6 +701,35 @@ def validate(root: Path, profile: Profile) -> Report:
     return report
 
 
+def scope_for(changed: Iterable[str]) -> Scope:
+    """How much of the `team` profile a set of changed paths can possibly fail.
+
+    `full` when a document, the README or the validator itself moved, `meta`
+    when only `data/` moved, `none` when nothing the profile reads changed.
+    Windows separators are accepted because a rehearsal on a laptop compares
+    paths typed by hand, while a runner reports them from `git diff`.
+
+    An empty list means "nothing changed", and the caller decides what to do
+    with that: a pull request with an empty diff is a failure to understand the
+    request and is checked in full, while a branch that was created a moment ago
+    has nothing to compare against and is not checked at all.
+    """
+    paths = [item.strip().replace("\\", "/") for item in changed]
+    paths = [item for item in paths if item]
+    if any(item in FULL_SCOPE_FILES or item.startswith(FULL_SCOPE_PREFIXES) for item in paths):
+        return "full"
+    if any(item.startswith(META_SCOPE_PREFIXES) for item in paths):
+        return "meta"
+    return "none"
+
+
+def read_changed_paths(source: str) -> list[str]:
+    """Changed paths from a file with one path per line, or from stdin for `-`."""
+    if source == "-":
+        return sys.stdin.read().splitlines()
+    return Path(source).read_text(encoding="utf-8").splitlines()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="validate_docs",
@@ -704,6 +747,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="что проверяем: артефакты команды, эталон или координационный репозиторий",
     )
     parser.add_argument("--ci", action="store_true", help="аннотации для GitHub Actions")
+    parser.add_argument(
+        "--scope",
+        metavar="FILE",
+        default=None,
+        help="определить круг проверки по списку изменённых файлов и вывести full, meta или none",
+    )
     parser.add_argument("--json", action="store_true", help="вывод в виде JSON")
     parser.add_argument(
         "--strict",
@@ -715,6 +764,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # `--scope` отвечает на вопрос «что имеет смысл проверять», а не «что не так»,
+    # поэтому входных документов ему не нужно: список изменённых файлов приходит
+    # из `git diff` на runner.
+    if args.scope is not None:
+        print(scope_for(read_changed_paths(args.scope)))
+        return 0
+
     report = validate(Path(args.root).resolve(), args.profile)
 
     if args.json:
