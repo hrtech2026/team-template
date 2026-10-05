@@ -150,6 +150,47 @@ ID_MAX_LENGTH = 64
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REMOTE_URL_RE = re.compile(r"url\s*=\s*(?P<url>\S+)")
 
+# Таблица состава в README — единственное место, где команда пишет имена
+# участников, и единственный источник этих имён для витрины. Формат таблицы
+# зафиксирован в эталоне (templates/team-template/README.md) и проверяется
+# scripts/check_hub.py: переименование колонки обнулило бы имена у всех
+# команд практики разом, и заметить это можно было бы только на витрине.
+ROSTER_NAME_HEADINGS = ("участник", "участники", "фио", "имя", "фамилия и имя")
+ROSTER_LOGIN_HEADINGS = ("github", "github-логин", "логин", "аккаунт")
+ROSTER_ROLE_HEADINGS = ("роль", "роли")
+# То, что команда оставила от эталона, именем не считается. ЗАПОЛНИТЕ,
+# {{...}} и прочие маркеры ловит PLACEHOLDER_PATTERNS, здесь — то, что
+# осталось в таблице состава эталона.
+ROSTER_PLACEHOLDER_NAMES = frozenset(
+    {
+        "фамилия имя",
+        "фамилия и имя",
+        "имя фамилия",
+        "фамилия и.",
+        "фамилия",
+        "имя",
+        "ф. и. о.",
+        "фио",
+        "name",
+        "full name",
+        "username",
+        "login",
+        "@login",
+    }
+)
+# Заголовок колонки «Роль» команда пишет по-русски, а `meta.yml` хранит
+# английский код. Сопоставляем по первому слову: у всех ролей оно разное.
+README_ROLE_HEADS = {
+    "капитан": "captain",
+    "аналитик": "analyst",
+    "архитектор": "architect",
+    "требования": "requirements",
+    "исследователь": "data_researcher",
+}
+GITHUB_LOGIN_RE = re.compile(r"@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\][]*)\]\([^()]*\)")
+TABLE_SEPARATOR_RE = re.compile(r"^:?-{2,}:?$")
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -306,6 +347,151 @@ def is_meaningful(text: str) -> bool:
     if not lines:
         return False
     return not any(pattern.search(text) for _, pattern in PLACEHOLDER_PATTERNS)
+
+
+@dataclass(frozen=True)
+class RosterRow:
+    """One line of the roster table, already reduced to text."""
+
+    line: int
+    login: str
+    name: str
+    role: str
+
+
+@dataclass(frozen=True)
+class RosterTable:
+    line: int
+    name_column: int
+    login_column: int
+    role_column: int | None
+    rows: tuple[RosterRow, ...]
+
+
+def normalize_cell(text: str) -> str:
+    """Reduce a table cell to comparable text: links keep their label, markup drops."""
+    plain = MARKDOWN_LINK_RE.sub(r"\1", text)
+    plain = re.sub(r"[*`_]", " ", plain)
+    return " ".join(plain.split()).casefold()
+
+
+def table_cells(line: str) -> list[str] | None:
+    """Split a markdown table row into cells, or `None` if the line is not one."""
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return None
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def is_table_separator(cells: list[str]) -> bool:
+    """Whether the cells are the `|---|---|` rule under a table header."""
+    return bool(cells) and all(TABLE_SEPARATOR_RE.match(cell.strip()) for cell in cells)
+
+
+def column_index(header: list[str], headings: tuple[str, ...]) -> int | None:
+    """Index of the first column whose header matches one of `headings`."""
+    for index, cell in enumerate(header):
+        if normalize_cell(cell) in headings:
+            return index
+    return None
+
+
+def is_roster_placeholder(value: str) -> bool:
+    """Whether a name cell holds nothing but the template's scaffolding."""
+    if not value.strip():
+        return True
+    if normalize_cell(value) in ROSTER_PLACEHOLDER_NAMES:
+        return True
+    return any(pattern.search(value) for _, pattern in PLACEHOLDER_PATTERNS)
+
+
+def role_from_label(label: str) -> str | None:
+    """Map a role written in a README to the code `data/meta.yml` stores."""
+    normalized = normalize_cell(label)
+    if normalized in VALID_ROLES:
+        return normalized
+    if not normalized:
+        return None
+    return README_ROLE_HEADS.get(normalized.split(" ")[0])
+
+
+def _roster_row(
+    cells: list[str],
+    name_column: int,
+    login_column: int,
+    role_column: int | None,
+    line: int,
+) -> RosterRow:
+    login_match = GITHUB_LOGIN_RE.search(cells[login_column]) if login_column < len(cells) else None
+    role = ""
+    if role_column is not None and role_column < len(cells):
+        role = cells[role_column].strip()
+    return RosterRow(
+        line=line,
+        login=login_match.group(1) if login_match else "",
+        name=cells[name_column].strip() if name_column < len(cells) else "",
+        role=role,
+    )
+
+
+def find_roster_table(text: str) -> RosterTable | None:
+    """The first pipe table whose header names both a participant and a GitHub column.
+
+    Fails closed on purpose. A renamed or reordered header yields no table at
+    all, and the team is left without names on the showcase, rather than names
+    attributed to the wrong member of the team.
+    """
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        header = table_cells(lines[index])
+        rule = table_cells(lines[index + 1]) if index + 1 < len(lines) else None
+        if header is None or rule is None or not is_table_separator(rule):
+            index += 1
+            continue
+        name_column = column_index(header, ROSTER_NAME_HEADINGS)
+        login_column = column_index(header, ROSTER_LOGIN_HEADINGS)
+        role_column = column_index(header, ROSTER_ROLE_HEADINGS)
+        if name_column is None or login_column is None:
+            index += 2
+            continue
+        rows: list[RosterRow] = []
+        offset = index + 2
+        while offset < len(lines):
+            cells = table_cells(lines[offset])
+            if cells is None:
+                break
+            if not is_table_separator(cells):
+                rows.append(_roster_row(cells, name_column, login_column, role_column, offset + 1))
+            offset += 1
+        return RosterTable(
+            line=index + 1,
+            name_column=name_column,
+            login_column=login_column,
+            role_column=role_column,
+            rows=tuple(rows),
+        )
+    return None
+
+
+def roster_names(text: str) -> dict[str, str]:
+    """Map every login to the name the team wrote for it in the roster table.
+
+    Only filled rows count, and the first row for a login wins. Membership and
+    roles stay in `data/meta.yml`, which the panel owns: a README can add a
+    name to a known member, never a member or a role of its own.
+    """
+    table = find_roster_table(text)
+    names: dict[str, str] = {}
+    if table is None:
+        return names
+    for row in table.rows:
+        if not row.login or row.login in names:
+            continue
+        if is_roster_placeholder(row.name):
+            continue
+        names[row.login] = row.name.strip()
+    return names
 
 
 def check_file_presence(root: Path, report: Report, required: Iterable[str]) -> None:
@@ -611,6 +797,118 @@ def check_meta(root: Path, report: Report) -> None:
             )
 
 
+def check_readme_roster(root: Path, report: Report, profile: Profile) -> None:
+    """Check the README roster table against `data/meta.yml`.
+
+    The README is where a team writes member names, and the showcase publishes
+    those names, so a team that fills the table gets its composition on the
+    card. Two mistakes are worth stopping: a login that `meta.yml` does not
+    know, which asserts a member the panel never granted anything to, and a
+    name left as scaffolding, which drops the member off the card silently.
+
+    Unfilled template rows are never an error. A fresh repository carries five
+    identical `@login` rows, and failing on them would block the first Pull
+    Request of every team right after provisioning. Only a row the team
+    actually filled makes a claim worth checking.
+    """
+    target = root / "README.md"
+    if not target.is_file():
+        return
+
+    table = find_roster_table(target.read_text(encoding="utf-8"))
+    if table is None:
+        report.add(
+            "warning" if profile == "team" else "error",
+            "readme.roster.missing",
+            "README.md",
+            "нет таблицы состава с колонками «Участник» и «GitHub»: имена участников "
+            "не попадут на витрину. Заголовки колонок не переименовывайте",
+        )
+        return
+    if profile == "template":
+        return
+
+    meta_target = root / "data/meta.yml"
+    if not meta_target.is_file():
+        return
+    meta, error = load_yaml_mapping(meta_target)
+    if error is not None or meta is None:
+        return
+    roles_by_login: dict[str, str] = {}
+    for member in meta.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        login = str(member.get("login") or "")
+        if login:
+            roles_by_login[login] = str(member.get("role") or "")
+
+    seen: set[str] = set()
+    for row in table.rows:
+        # Заполненная строка — это утверждение команды. Пока в ней стоит
+        # заготовка эталона, она ничего не утверждает и ничего не ломает.
+        filled = not is_roster_placeholder(row.name)
+        if not row.login:
+            if filled:
+                report.add(
+                    "warning",
+                    "readme.roster.no_login",
+                    "README.md",
+                    "строка состава заполнена без @логина, в витрину она не попадёт",
+                    row.line,
+                )
+            continue
+        if filled and row.login in seen:
+            report.add(
+                "error",
+                "readme.roster.duplicate",
+                "README.md",
+                f"@{row.login} повторяется в таблице состава",
+                row.line,
+            )
+            continue
+        seen.add(row.login)
+        declared_role = roles_by_login.get(row.login)
+        if declared_role is None:
+            if filled:
+                report.add(
+                    "error",
+                    "readme.roster.unknown_login",
+                    "README.md",
+                    f"@{row.login} нет в data/meta.yml: состав ведёт пульт, изменение — "
+                    "только через заявку «Изменение состава»",
+                    row.line,
+                )
+            continue
+        if not filled:
+            report.add(
+                "warning",
+                "readme.roster.name",
+                "README.md",
+                f"не заполнено имя участника @{row.login}, он не попадёт в состав на витрине",
+                row.line,
+            )
+            continue
+        declared_readme_role = role_from_label(row.role)
+        if declared_readme_role is not None and declared_readme_role != declared_role:
+            report.add(
+                "warning",
+                "readme.roster.role",
+                "README.md",
+                f"роль в README ({row.role.strip()}) не совпадает с data/meta.yml "
+                f"({declared_role}), права выдаёт meta.yml",
+                row.line,
+            )
+
+    for login in sorted(set(roles_by_login) - seen):
+        report.add(
+            "warning",
+            "readme.roster.absent",
+            "README.md",
+            f"@{login} есть в data/meta.yml, но нет в таблице состава: его имя "
+            "не попадёт на витрину",
+        )
+
+
 def load_yaml_mapping(target: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         data = yaml.safe_load(target.read_text(encoding="utf-8"))
@@ -660,6 +958,7 @@ def validate(root: Path, profile: Profile) -> Report:
             else:
                 report.add("warning", "file.optional", relative, "необязательный файл отсутствует")
         check_meta(root, report)
+        check_readme_roster(root, report, profile)
         return report
 
     if profile == "template":
@@ -695,6 +994,7 @@ def validate(root: Path, profile: Profile) -> Report:
                 if any(not block.strip() for block in blocks):
                     report.add("error", "diagram.empty", relative, "блок ```mermaid``` пуст")
         check_meta(root, report)
+        check_readme_roster(root, report, profile)
         return report
 
     check_coordination(root, report)
