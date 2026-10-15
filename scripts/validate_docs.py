@@ -98,6 +98,17 @@ OPTIONAL_TEAM_FILES = ("docs/05_glossary.md",)
 REQUIRED_TEAM_FILES = tuple(path for path in DOCUMENT_SPECS if path not in OPTIONAL_TEAM_FILES)
 REQUIRED_TEAM_PATHS = (*REQUIRED_TEAM_FILES, "data/meta.yml", "README.md")
 
+# Порядок сдачи этапов. Документ, который команда начала, тянет за собой все
+# предыдущие: иначе этапы можно перепрыгнуть, написав `04_requirements.md` и
+# оставив `01_problem.md` с заготовками. Тот же порядок живёт в `STAGE_ARTIFACTS`
+# (scripts/aggregate.py) и выводит фактический этап команды на витрину.
+DOCUMENT_ORDER: tuple[str, ...] = (
+    "docs/01_problem.md",
+    "docs/02_asis_analysis.md",
+    "docs/03_tobe_architecture.md",
+    "docs/04_requirements.md",
+)
+
 # What the `team` profile reads, and therefore what a commit has to touch to be
 # able to fail it. A change outside these paths cannot turn a full validation
 # red, so running one on it only repeats an old verdict about documents nobody
@@ -518,20 +529,23 @@ def comment_line_numbers(text: str) -> set[int]:
     return covered
 
 
-def check_placeholders(root: Path, report: Report, relative: str) -> None:
-    """Report leftover scaffolding.
+def leftover_placeholders(target: Path) -> list[tuple[str, int, str]]:
+    """Every leftover marker in a file, as (code, line, matched text).
 
-    `ЗАПОЛНИТЕ` and `{{ ... }}` are instructions to the author, so their
-    occurrence inside a comment is not a leftover. A `TODO` comment is the
-    opposite: it is exactly the kind of unfinished work we must catch, so it
-    is searched in the raw text.
+    One definition of "заготовка" for everything that asks: the report to the
+    team, the question "has the team started this document", and the check on a
+    merged branch. Three callers with three slightly different regexes, and the
+    stage the showcase shows starts disagreeing with the stage the check demands.
+
+    `ЗАПОЛНИТЕ` and `{{ ... }}` inside a comment are instructions to the author,
+    not leftovers, so they are skipped there. A `TODO` comment is the opposite:
+    it is exactly the kind of unfinished work we must catch, so it is searched
+    in the raw text.
     """
-    target = root / relative
-    if not target.is_file():
-        return
     text = target.read_text(encoding="utf-8")
     commented = comment_line_numbers(text)
 
+    found: list[tuple[str, int, str]] = []
     for number, raw_line in enumerate(text.splitlines(), 1):
         for code, pattern in PLACEHOLDER_PATTERNS:
             if code != "todo_marker" and number in commented:
@@ -539,17 +553,48 @@ def check_placeholders(root: Path, report: Report, relative: str) -> None:
             match = pattern.search(raw_line)
             if match is None:
                 continue
-            report.add(
-                "error",
-                f"placeholder.{code}",
-                relative,
-                f"осталась заготовка: {match.group(0)[:60]}",
-                number,
-            )
+            found.append((code, number, match.group(0)[:60]))
             break
+    return found
 
 
-def check_document(root: Path, report: Report, relative: str, profile: Profile) -> None:
+def document_is_filled(target: Path) -> bool:
+    """Whether the team has finished this document: it exists and has no scaffolding.
+
+    Presence alone would say otherwise — the template ships all five files — and
+    a team that has written nothing would look as far along as one that has
+    written everything.
+    """
+    return target.is_file() and not leftover_placeholders(target)
+
+
+def check_placeholders(root: Path, report: Report, relative: str) -> None:
+    target = root / relative
+    if not target.is_file():
+        return
+    for code, number, match in leftover_placeholders(target):
+        report.add(
+            "error",
+            f"placeholder.{code}",
+            relative,
+            f"осталась заготовка: {match}",
+            number,
+        )
+
+
+def check_document(
+    root: Path,
+    report: Report,
+    relative: str,
+    profile: Profile,
+    enforce_content: bool = True,
+) -> None:
+    """Check one document: its shape always, its content only when it was started.
+
+    `enforce_content` is false for a document the team has not reached yet. The
+    structural half — frontmatter, required sections, the file's existence — is
+    the same for a finished document and for the template, so it always runs.
+    """
     target = root / relative
     if not target.is_file():
         return
@@ -597,7 +642,7 @@ def check_document(root: Path, report: Report, relative: str, profile: Profile) 
                 f"секция `{section}` начинается с уровня h{level}, ожидался h2",
                 body_start + line - 1,
             )
-        if section in {"Human-in-the-Loop"} and profile == "team":
+        if section in {"Human-in-the-Loop"} and profile == "team" and enforce_content:
             content = section_body(body, line, level)
             if not is_meaningful(content):
                 report.add(
@@ -608,7 +653,9 @@ def check_document(root: Path, report: Report, relative: str, profile: Profile) 
                     body_start + line - 1,
                 )
 
-    if spec["mermaid"]:
+    # Диаграмма — это содержание, а не форма: в документе, который команда ещё
+    # не начала, её отсутствие законно, и ругаться на неё не на кого.
+    if spec["mermaid"] and (profile != "team" or enforce_content):
         blocks = MERMAID_RE.findall(body)
         if not blocks:
             report.add("error", "diagram.missing", relative, "нет диаграммы ```mermaid```")
@@ -622,7 +669,7 @@ def check_document(root: Path, report: Report, relative: str, profile: Profile) 
                     f"пустые блоки ```mermaid```: {', '.join(str(i) for i in empty)}",
                 )
 
-    if profile == "team":
+    if profile == "team" and enforce_content:
         check_placeholders(root, report, relative)
 
 
@@ -657,7 +704,7 @@ def repository_name(root: Path) -> str | None:
     return None
 
 
-def check_meta(root: Path, report: Report) -> None:
+def check_meta(root: Path, report: Report, profile: Profile) -> None:
     target = root / "data/meta.yml"
     if not target.is_file():
         return
@@ -690,7 +737,7 @@ def check_meta(root: Path, report: Report) -> None:
         # team's own pull request instead of publishing the mismatch to the
         # showcase. The template profile is exempt on purpose: the reference
         # repository is called `team-template` and its `id` is a placeholder.
-        current = repository_name(root)
+        current = repository_name(root) if profile == "team" else None
         if current and team_id != current:
             report.add(
                 "error",
@@ -941,23 +988,32 @@ def check_coordination(root: Path, report: Report) -> None:
                 )
 
 
-def validate(root: Path, profile: Profile) -> Report:
+def validate(root: Path, profile: Profile, enforced: frozenset[str] | None = None) -> Report:
+    """Run a profile over a tree.
+
+    `enforced` lists the documents whose content this run may hold the team to;
+    `None` means "no diff was available", and every document is checked. It only
+    narrows the `team` profile: stages are submitted document by document, and a
+    document the team has not started yet cannot be failed for being unwritten.
+    """
     report = Report(root=str(root), profile=profile)
 
     if not root.is_dir():
         report.add("error", "root.missing", str(root), "каталог не найден")
         return report
 
+    in_force = frozenset(DOCUMENT_SPECS) if enforced is None else enforced
+
     if profile == "team":
         check_file_presence(root, report, REQUIRED_TEAM_PATHS)
         for relative in REQUIRED_TEAM_FILES:
-            check_document(root, report, relative, profile)
+            check_document(root, report, relative, profile, relative in in_force)
         for relative in OPTIONAL_TEAM_FILES:
             if (root / relative).is_file():
-                check_document(root, report, relative, profile)
+                check_document(root, report, relative, profile, relative in in_force)
             else:
                 report.add("warning", "file.optional", relative, "необязательный файл отсутствует")
-        check_meta(root, report)
+        check_meta(root, report, profile)
         check_readme_roster(root, report, profile)
         return report
 
@@ -993,7 +1049,7 @@ def validate(root: Path, profile: Profile) -> Report:
                 blocks = MERMAID_RE.findall(body)
                 if any(not block.strip() for block in blocks):
                     report.add("error", "diagram.empty", relative, "блок ```mermaid``` пуст")
-        check_meta(root, report)
+        check_meta(root, report, profile)
         check_readme_roster(root, report, profile)
         return report
 
@@ -1030,6 +1086,36 @@ def read_changed_paths(source: str) -> list[str]:
     return Path(source).read_text(encoding="utf-8").splitlines()
 
 
+def enforced_documents(root: Path, changed: Iterable[str] | None) -> frozenset[str]:
+    """Which documents a change may be held to, on content.
+
+    `scope_for` answers whether a check is worth running at all. This answers a
+    narrower question: a pull request that submits stage 1 must not fail over the
+    scaffolding in `03_tobe_architecture.md`, which the team has no reason to
+    have written yet — the regulation has them submit one stage at a time. So a
+    document is enforced when the change touched it, or when the team has already
+    finished it and could otherwise rot behind a later change. The latest started
+    document drags in every earlier one, so stages cannot be skipped in order.
+
+    `None` means the change set is unknown — an unreadable diff, a runner that
+    could not compare — and everything is enforced, exactly as before.
+    """
+    if changed is None:
+        return frozenset(DOCUMENT_SPECS)
+
+    paths = [item.strip().replace("\\", "/") for item in changed]
+    touched = {item for item in paths if item in DOCUMENT_SPECS}
+    active = [
+        relative
+        for relative in DOCUMENT_ORDER
+        if relative in touched or document_is_filled(root / relative)
+    ]
+    if not active:
+        return frozenset(touched)
+    latest = DOCUMENT_ORDER.index(active[-1])
+    return frozenset(DOCUMENT_ORDER[: latest + 1]) | touched
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="validate_docs",
@@ -1047,6 +1133,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="что проверяем: артефакты команды, эталон или координационный репозиторий",
     )
     parser.add_argument("--ci", action="store_true", help="аннотации для GitHub Actions")
+    parser.add_argument(
+        "--changed",
+        metavar="FILE",
+        default=None,
+        help=(
+            "список изменённых файлов: на содержание проверяются только начатые "
+            "документы; файла нет — состав изменений неизвестен, проверяются все"
+        ),
+    )
     parser.add_argument(
         "--scope",
         metavar="FILE",
@@ -1072,7 +1167,13 @@ def main(argv: list[str] | None = None) -> int:
         print(scope_for(read_changed_paths(args.scope)))
         return 0
 
-    report = validate(Path(args.root).resolve(), args.profile)
+    root = Path(args.root).resolve()
+    # Отсутствие файла — не пустой diff, а неизвестный состав изменений: воркфлоу
+    # создаёт его только там, где `git diff` отработал. Неизвестно — проверяем всё.
+    changed = None
+    if args.changed and Path(args.changed).is_file():
+        changed = read_changed_paths(args.changed)
+    report = validate(root, args.profile, enforced_documents(root, changed))
 
     if args.json:
         payload = {
